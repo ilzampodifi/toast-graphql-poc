@@ -850,10 +850,908 @@ All restaurants returned consistent JSON structure — confirming the API schema
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | Toast changes persisted query hashes | Low — hashes have been stable across multiple app versions | Modifier fetch fails with 400 errors | Monitor for errors; hashes can be re-captured automatically by running browser intercept |
-| Cloudflare blocks headless browsers entirely | Low — this would also break Toast's own monitoring tools | Phase 1 would fail | Same risk as current scraper; can explore managed browser services as fallback |
+| Cloudflare blocks headless browsers entirely | Low — this would also break Toast's own monitoring tools | Phase 1 would fail | Same risk as current scraper; residential proxy rotation as mitigation (see below) |
+| IP-based blocking at scale | Medium — Lambda uses a limited pool of AWS IPs | Repeated blocks, increased failure rate | Residential rotating proxy (see below) |
 | Toast rate-limits the GraphQL endpoint | Medium — we make multiple calls per restaurant | Modifier fetch slows down or fails | Configurable concurrency and delay; can spread requests over time |
 | Cookies expire during Phase 2 | Very low — cookies valid for 30+ minutes, Phase 2 completes in seconds | Modifier fetch returns errors | Detect expiration and re-run Phase 1 to get fresh cookies |
 | Toast deprecates persisted query operations | Very low — these are core to their own frontend | Entire approach would need updating | Would also break Toast's own website; migration would be visible in advance |
+
+---
+
+## Residential Rotating Proxy
+
+At scale, Lambda functions run from a limited pool of AWS IP addresses. Anti-bot systems like Cloudflare can detect and block datacenter IPs, especially when multiple requests originate from the same IP range in a short period. Residential rotating proxies route each request through a different residential IP address, making traffic appear as regular consumer browsing.
+
+This is a nice-to-have for the current stage, but will be needed when scraping at scale (hundreds or thousands of restaurants per run).
+
+### How It Works
+
+Both Phase 1 (browser) and Phase 2 (HTTP) route through the same proxy within a single scrape cycle. Since our input is a single restaurant URL/slug per Lambda invocation, all requests for that restaurant go through one rotating proxy session — ensuring consistent IP behavior for Cloudflare while still rotating across different Lambda invocations.
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam componentBackgroundColor #E8F0FE
+skinparam componentBorderColor #3366CC
+skinparam arrowColor #3366CC
+skinparam cloudBackgroundColor #F0F4FF
+skinparam noteBackgroundColor #FFFFCC
+
+title Residential Rotating Proxy — Request Flow
+
+rectangle "AWS Lambda" as lambda {
+  component "Phase 1\nPlaywright Browser" as P1
+  component "Phase 2\nDirect HTTP (fetch)" as P2
+}
+
+cloud "Residential Proxy\n(rotating IPs)" as proxy #FFF3E0 {
+  component "Session A\n(IP: 73.x.x.x)" as S1
+}
+
+cloud "Toast Platform" as toast {
+  component "toasttab.com\n(Cloudflare)" as CF
+  component "GraphQL API\nws-api.toasttab.com" as API
+}
+
+P1 --> S1 : browser traffic\n(page load)
+P2 --> S1 : HTTP requests\n(modifier fetches)
+
+note right of S1
+  Same session IP for
+  entire scrape cycle
+  (Phase 1 + Phase 2)
+
+  Different IP per
+  Lambda invocation
+end note
+
+S1 --> CF : appears as\nresidential user
+S1 --> API : appears as\nresidential user
+
+@enduml
+```
+
+### Without vs With Proxy — At Scale
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam sequenceArrowColor #3366CC
+skinparam sequenceParticipantBorderColor #3366CC
+skinparam sequenceParticipantBackgroundColor #E8F0FE
+
+title Scraping at Scale — Without vs With Residential Proxy
+
+== Without Proxy (current) ==
+
+participant "Lambda 1\n(AWS IP: 54.x.x.1)" as L1
+participant "Lambda 2\n(AWS IP: 54.x.x.2)" as L2
+participant "Lambda 3\n(AWS IP: 54.x.x.3)" as L3
+participant "Cloudflare" as CF
+
+L1 -> CF: Restaurant A
+note right of CF: AWS datacenter IP detected
+L2 -> CF: Restaurant B
+note right of CF: Same IP range — suspicious
+L3 -> CF: Restaurant C
+CF --> L3: **403 Blocked**
+note right of CF #FFEBEE
+  Pattern detected:
+  Multiple requests from
+  same AWS IP range
+  within short window
+end note
+
+== With Residential Proxy ==
+
+participant "Lambda 1\n-> Proxy (73.x.x.5)" as LP1
+participant "Lambda 2\n-> Proxy (98.x.x.12)" as LP2
+participant "Lambda 3\n-> Proxy (104.x.x.88)" as LP3
+participant "Cloudflare " as CF2
+
+LP1 -> CF2: Restaurant A
+note right of CF2: Residential IP — normal user
+LP2 -> CF2: Restaurant B
+note right of CF2: Different residential IP — normal user
+LP3 -> CF2: Restaurant C
+CF2 --> LP3: **200 OK**
+note right of CF2 #E8F5E9
+  Each request from
+  different residential IP
+  Looks like normal
+  consumer traffic
+end note
+
+@enduml
+```
+
+### Integration Points
+
+Residential proxy configuration would be applied at two points:
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam activityBackgroundColor #F0F4FF
+skinparam activityBorderColor #3366CC
+skinparam arrowColor #3366CC
+
+title Proxy Integration Points
+
+start
+
+:Lambda receives restaurant URL;
+
+partition "Phase 1 — Browser" #E8F0FE {
+  :Playwright launch with proxy config;
+  note right
+    chromium.launch({
+      proxy: {
+        server: PROXY_URL,
+        username: PROXY_USER,
+        password: PROXY_PASS
+      }
+    })
+  end note
+  :Navigate + intercept GraphQL;
+  :Capture cookies & headers;
+}
+
+partition "Phase 2 — HTTP" #E8F5E9 {
+  :Configure fetch agent with proxy;
+  note right
+    Bun/Node fetch with
+    proxy agent using
+    same session/credentials
+  end note
+  :Fetch modifiers via proxy;
+}
+
+:Save results;
+
+stop
+
+@enduml
+```
+
+### Provider Landscape
+
+Several residential proxy providers exist in the market:
+
+| Provider | Pool Size | Pricing Model |
+|----------|-----------|---------------|
+| Bright Data | 72M+ IPs | Per GB / per request |
+| Oxylabs | 100M+ IPs | Per GB |
+| SmartProxy | 55M+ IPs | Per GB |
+| IPRoyal | 32M+ IPs | Per GB / pay-as-you-go |
+| NetNut | 85M+ IPs | Per GB |
+| Soax | 8.5M+ IPs | Per GB / per port |
+
+### Priority
+
+| Stage | Need | Status |
+|-------|------|--------|
+| Development / PoC | Not needed | Current |
+| Small-scale production (<100 restaurants/day) | Nice to have | Planned |
+| Scale production (1000+ restaurants/day) | Required | Future |
+
+---
+
+## Error Handling Strategy
+
+Based on lessons learned from the old scraper ([error handling audit](../docs/error-handling-scraper-old.md)), the new scraper implements a **two-layer retry strategy** matching the old scraper's proven pattern, while fixing gaps that were never addressed.
+
+### Two-Layer Retry Architecture
+
+The scraper uses two independent retry mechanisms that work in sequence — exactly like the old scraper, but with improvements at each layer.
+
+**Layer 1 (internal):** Retry within the same Lambda invocation — fast, no cold start overhead, uses the same cookies/session.
+
+**Layer 2 (SQS re-queue):** If the entire invocation fails, SQS sends the message to a new Lambda — fresh browser, fresh cookies, fresh internal retries.
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam componentBackgroundColor #E8F0FE
+skinparam componentBorderColor #3366CC
+skinparam arrowColor #3366CC
+skinparam noteBackgroundColor #FFFFCC
+
+title Two-Layer Retry Architecture
+
+rectangle "**Layer 1: Internal Retry**\n(within same Lambda invocation)" as L1 #E8F0FE {
+  component "Phase 1\nBrowser Intercept" as P1
+  component "Phase 2\nfetchWithRetry()" as P2
+  component "Circuit Breaker" as CB
+
+  P1 --> P2 : cookies +\nheaders
+  P2 --> CB : consecutive\nfailures?
+}
+
+note right of P1
+  **No internal retry**
+  Single attempt, 60s timeout
+  Failure = entire restaurant fails
+  (same as old scraper)
+end note
+
+note right of P2
+  **3 retries per item**
+  Exponential backoff
+  429: honor Retry-After
+  Fatal (400/401/404/410): no retry
+end note
+
+note right of CB
+  **5 consecutive failures**
+  = stop processing batch
+  (old scraper: no circuit breaker,
+   burned all retries for every item)
+end note
+
+rectangle "**Layer 2: SQS Re-Queue**\n(new Lambda invocation — pending)" as L2 #FFF3E0 {
+  component "batchItemFailures" as BIF
+  component "Dead-Letter Queue" as DLQ
+}
+
+L1 --> BIF : ScrapingError\nfatal: false
+L1 --> DLQ : ScrapingError\nfatal: true
+BIF --> L1 : Fresh Lambda\n(new browser,\nnew cookies,\nnew retries)
+
+note bottom of BIF
+  SQS maxReceiveCount
+  controls total re-queues
+  before dead-letter (TBD)
+end note
+
+@enduml
+```
+
+### HTTP Status Code Decision Tree
+
+How each HTTP status code is handled during Phase 2 modifier fetches:
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam activityBackgroundColor #F0F4FF
+skinparam activityBorderColor #3366CC
+skinparam arrowColor #3366CC
+
+title HTTP Status Code Handling — fetchWithRetry()
+
+start
+
+:HTTP Response received;
+
+switch (Status code?)
+
+case (200 OK)
+  #E8F5E9:Return response
+  (success);
+  stop
+
+case (400 Bad Request)
+  #FFEBEE:Throw ScrapingError
+  **fatal: true**
+  "Invalid request — likely
+  bad GUID or query hash changed";
+  stop
+
+case (401 Unauthorized)
+  #FFEBEE:Throw ScrapingError
+  **fatal: true**
+  "Auth failed — cookies invalid
+  or session expired";
+  stop
+
+case (404 Not Found)
+  #FFEBEE:Throw ScrapingError
+  **fatal: true**
+  "Item/restaurant doesn't exist";
+  stop
+
+case (410 Gone)
+  #FFEBEE:Throw ScrapingError
+  **fatal: true**
+  "Resource permanently removed";
+  stop
+
+case (429 Too Many Requests)
+  #FFF3E0:Read Retry-After header
+  Wait specified seconds
+  (default 5s if no header)
+  **Retry** (up to 3 times);
+  stop
+
+case (500 Internal Server Error)
+  #FFF3E0:Exponential backoff
+  1000ms * 2^(attempt-1) + jitter
+  **Retry** (up to 3 times);
+  stop
+
+case (502 Bad Gateway)
+  #FFF3E0:Exponential backoff
+  "Upstream server down temporarily"
+  **Retry** (up to 3 times);
+  stop
+
+case (503 Service Unavailable)
+  #FFF3E0:Exponential backoff
+  "Server overloaded or maintenance"
+  **Retry** (up to 3 times);
+  stop
+
+case (504 Gateway Timeout)
+  #FFF3E0:Exponential backoff
+  "Upstream timed out"
+  **Retry** (up to 3 times);
+  stop
+
+case (Other)
+  #FFF3E0:Exponential backoff
+  **Retry** (up to 3 times);
+  stop
+
+endswitch
+
+@enduml
+```
+
+### Error Handling Comparison Table
+
+| # | Capability | Old Scraper | New Scraper | Notes |
+|---|-----------|-------------|-------------|-------|
+| — | Fatal status detection (400/401/404/410) | Have | Have | Same behavior |
+| — | Retry with exponential backoff | Have (HTTP client) | Have (fetchWithRetry) | Same formula: base * 2^n + jitter, cap 30s |
+| — | Per-URL/item error isolation | Have | Have | Old: per-URL. New: Promise.allSettled per item |
+| — | Rate limiting between requests | Have | Have | Old: configurable limiter. New: 200ms batch delay |
+| 1 | 429 handling with Retry-After | **Missing** | **Fixed** | Old fell into generic retry path |
+| 2 | 5xx distinction | **Missing** | **Fixed** | Old treated all 5xx identically |
+| 3 | Browser retry on failure | **Missing** | Missing | Neither scraper retries Phase 1 — single attempt |
+| 5 | Browser cleanup on error | **Missing** | **Fixed** | finally block prevents Chromium leaks |
+| 6 | Circuit breaker | **Missing** | **Fixed** | 5 consecutive failures = stop batch |
+| 7 | ScrapingError as real class | **Missing** (plain object) | **Fixed** | Proper Error subclass with stack trace |
+| 11 | Response body in errors | **Missing** | **Fixed** | Truncated 500 chars for CloudWatch |
+| — | Phase 1 data validation | **Missing** | **Fixed** | Validates session headers + menu structure |
+| — | SQS batchItemFailures re-queue | Have | **Pending** | Needs Lambda handler (approval required) |
+| — | DB connection retry + pooling | Have | **Pending** | Needs DB integration |
+| — | Zod schema validation (Lambda input) | Have | **Pending** | Needs Lambda handler |
+| — | 403 anti-bot handling | Have | N/A | New scraper doesn't hit anti-bot (no stealth needed) |
+
+### Old vs New Scraper — Error Handling Comparison
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam defaultTextAlignment center
+
+title Error Handling Comparison — Old Scraper vs New Scraper
+
+legend top left
+  | Color | Meaning |
+  |<#E8F5E9>| Have (both scrapers) |
+  |<#E3F2FD>| Fixed in new scraper |
+  |<#FFF3E0>| Pending (needs Lambda handler) |
+  |<#FFEBEE>| Old scraper gap (never fixed) |
+endlegend
+
+|Old Scraper|New Scraper|
+
+|Old Scraper|
+start
+:HTTP Client retry;
+note right
+  3 retries, exponential backoff
+  base * 2^(attempt-1) + jitter
+  cap at 30s
+end note
+#E8F5E9:Fatal status detection
+(400, 401, 404, 410);
+#E8F5E9:403 anti-bot handling
+(15-25s delay);
+#FFEBEE:No 429 handling
+(issue #1);
+#FFEBEE:No 5xx distinction
+(issue #2);
+#FFEBEE:No browser retry
+(issue #3);
+#FFEBEE:No browser cleanup (finally)
+(issue #5 — Chromium leaks);
+#FFEBEE:No circuit breaker
+(issue #6 — burns all retries);
+#FFEBEE:ScrapingError is plain object
+(issue #7 — no stack trace);
+#FFEBEE:No response body in errors
+(issue #11 — hard to debug);
+#E8F5E9:Per-URL error isolation;
+#E8F5E9:SQS batchItemFailures re-queue;
+#E8F5E9:DB connection retry + pooling;
+stop
+
+|New Scraper|
+start
+:fetchWithRetry();
+note right
+  3 retries, exponential backoff
+  1000ms * 2^(attempt-1) + jitter
+  cap at 30s
+end note
+#E8F5E9:Fatal status detection
+(400, 401, 404, 410);
+#E3F2FD:429 handling
+(honors Retry-After header);
+#E3F2FD:5xx retried with backoff
+(distinguishes server errors);
+#E3F2FD:Browser cleanup via finally
+(always closes Chromium);
+#E3F2FD:Circuit breaker
+(5 consecutive failures = stop);
+#E3F2FD:ScrapingError class
+(real Error, fatal flag, stack trace);
+#E3F2FD:Response body in errors
+(truncated 500 chars for CloudWatch);
+#E3F2FD:Phase 1 data validation
+(session headers + menu structure);
+#E8F5E9:Per-item error isolation
+(Promise.allSettled);
+#FFF3E0:SQS batchItemFailures re-queue
+(pending — needs Lambda handler);
+#FFF3E0:DB connection retry + pooling
+(pending — needs DB integration);
+stop
+
+@enduml
+```
+
+### Internal Retry Flow (Phase 2 — Implemented)
+
+Each modifier fetch retries within the same Lambda invocation before giving up. This matches the old scraper's HTTP client pattern.
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam activityBackgroundColor #F0F4FF
+skinparam activityBorderColor #3366CC
+skinparam arrowColor #3366CC
+
+title fetchWithRetry() — Internal Retry Flow (Phase 2)
+
+start
+
+:Attempt 1: fetch(GraphQL API);
+
+if (Response OK?) then (200)
+  #E8F5E9:Return response;
+  stop
+endif
+
+:Read status code + response body (first 500 chars);
+
+if (Fatal status?) then (400/401/404/410)
+  #FFEBEE:Throw ScrapingError
+  fatal: true
+  (no retry, will dead-letter);
+  stop
+endif
+
+if (Status 429?) then (yes)
+  :Read Retry-After header;
+  :Wait Retry-After seconds
+  (default 5s if no header);
+else (5xx or other)
+  :Calculate backoff:
+  1000ms * 2^(attempt-1) + jitter
+  cap at 30s;
+  :Wait;
+endif
+
+:Attempt 2: fetch(GraphQL API);
+
+if (Response OK?) then (200)
+  #E8F5E9:Return response;
+  stop
+endif
+
+:Same status code evaluation;
+note right
+  Repeat up to
+  attempt 3 and 4
+end note
+
+:Attempt 3 → Attempt 4 (final);
+
+if (Response OK?) then (200)
+  #E8F5E9:Return response;
+  stop
+else (still failing)
+  #FFEBEE:Throw ScrapingError
+  fatal: false
+  retryCount: 3
+  statusCode + responseBody;
+  stop
+endif
+
+@enduml
+```
+
+### Circuit Breaker (Phase 2 — Implemented)
+
+Prevents burning Lambda time when Toast's API is down. The old scraper had no circuit breaker — a batch of 50 items would produce 200 failed requests (50 x 4 attempts each).
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam activityBackgroundColor #F0F4FF
+skinparam activityBorderColor #3366CC
+skinparam arrowColor #3366CC
+
+title Circuit Breaker — fetchAllModifiers()
+
+start
+
+:Start batch processing
+(e.g., 25 items with modifiers);
+
+repeat
+  if (consecutiveFailures >= 5?) then (yes)
+    #FFEBEE:Circuit breaker OPEN
+    Skip remaining items
+    Log: "N consecutive failures,
+    skipping remaining M items";
+    stop
+  endif
+
+  :Process batch of 3 items
+  (Promise.allSettled);
+
+  :For each result in batch;
+
+  if (Fulfilled?) then (yes)
+    #E8F5E9:Store modifiers;
+    :consecutiveFailures = 0;
+  else (rejected)
+    #FFF3E0:Log failure with
+    HTTP status + retry count;
+    :consecutiveFailures++;
+  endif
+
+  :Wait 200ms between batches;
+
+repeat while (More items?) is (yes)
+
+#E8F5E9:Return modifier map
+(partial success OK);
+
+stop
+
+@enduml
+```
+
+### Browser Cleanup (Phase 1 — Implemented)
+
+The old scraper had no `finally` block (issue #5). A mid-scrape error leaked the Chromium process, eating Lambda memory until the container died.
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam sequenceArrowColor #3366CC
+skinparam sequenceParticipantBorderColor #3366CC
+skinparam sequenceParticipantBackgroundColor #E8F0FE
+
+title Phase 1 — Browser Lifecycle (Old vs New)
+
+== Old Scraper (no finally block) ==
+
+participant "Lambda" as L1
+participant "Browser" as B1
+
+L1 -> B1: launch()
+activate B1
+L1 -> B1: navigate + intercept
+L1 -> B1: !! Error thrown mid-scrape !!
+note over B1 #FFEBEE
+  browser.close() never called
+  Chromium process leaked
+  Memory consumed until
+  Lambda container dies
+end note
+L1 x-> B1
+
+== New Scraper (with finally block) ==
+
+participant "Lambda " as L2
+participant "Browser " as B2
+
+L2 -> B2: launch()
+activate B2
+L2 -> B2: navigate + intercept
+L2 -> B2: !! Error thrown mid-scrape !!
+L2 -> B2: finally { browser.close() }
+deactivate B2
+note over B2 #E8F5E9
+  Browser always cleaned up
+  No memory leak
+end note
+L2 -> L2: Error propagates to handler
+
+@enduml
+```
+
+### Cookie Lifetime
+
+Toast cookies live ~30 minutes. Our max Lambda invocation is 15 minutes. Cookies captured in Phase 1 are always valid through Phase 2 — no persistence or refresh logic needed.
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+
+title Cookie Lifetime vs Lambda Execution
+
+concise "Cookie" as C
+concise "Lambda" as L
+
+@0
+L is "Phase 1\n(browser)" #E8F0FE
+C is "Fresh" #E8F5E9
+
+@5
+L is "Phase 2\n(HTTP)" #E8F5E9
+C is "Valid" #E8F5E9
+
+@15
+L is "Max timeout" #FFF3E0
+C is "Valid" #E8F5E9
+
+@30
+L is {-}
+C is "Expired" #FFEBEE
+
+@enduml
+```
+
+### SQS Re-Queue Strategy (Pending Implementation)
+
+The second retry layer is **SQS-based re-queuing**, matching the old scraper's `batchItemFailures` pattern. This is not yet implemented — it requires the Lambda handler, which needs approval and further review.
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam activityBackgroundColor #F0F4FF
+skinparam activityBorderColor #3366CC
+skinparam arrowColor #3366CC
+skinparam partitionBackgroundColor #FFFFFF
+
+title SQS Re-Queue Strategy (Pending — Needs Approval)
+
+|SQS|
+start
+:Message arrives
+(restaurant URL);
+
+|Lambda Handler|
+:Parse SQS record;
+:Validate input (Zod);
+
+partition "Scraper (internal retries already built)" {
+  :Phase 1: Browser intercept
+  (with finally cleanup);
+  :Phase 1 validation
+  (session headers + menu check);
+  :Phase 2: Fetch modifiers
+  (fetchWithRetry — 3 retries each)
+  (circuit breaker — 5 consecutive failures);
+}
+
+if (Success?) then (yes)
+  #E8F5E9:Save to database;
+  |SQS|
+  #E8F5E9:Message acknowledged
+  (removed from queue);
+  stop
+else (failed)
+  |Lambda Handler|
+  if (ScrapingError.fatal?) then (true)
+    note right
+      400, 401, 404, 410
+      Restaurant doesn't exist
+      or invalid request
+    end note
+    |SQS|
+    #FFEBEE:Dead-letter queue
+    (no retry);
+    stop
+  else (false)
+    note right
+      429, 5xx, timeout,
+      network errors
+    end note
+    :Add to batchItemFailures;
+    |SQS|
+    #FFF3E0:Re-queue message;
+    :New Lambda invocation
+    (fresh browser, fresh cookies,
+    fresh internal retries);
+    |Lambda Handler|
+    :Process again...;
+    note right
+      SQS maxReceiveCount
+      controls total re-queues
+      before dead-letter
+      (TBD)
+    end note
+  endif
+endif
+
+stop
+
+@enduml
+```
+
+Key design decisions for the handler (to be finalized):
+
+- **Per-record isolation**: Each SQS record processed independently; one failure doesn't stop the batch
+- **Fatal vs retryable**: The `ScrapingError.fatal` flag drives the re-queue decision — 404 (restaurant doesn't exist) goes to dead-letter, 503 (server down) gets re-queued
+- **SQS max receive count**: Controls how many times a message is re-queued before going to dead-letter (TBD, old scraper used SQS defaults)
+
+### End-to-End Error Scenarios
+
+What happens when things go wrong at each stage:
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+skinparam sequenceArrowColor #3366CC
+skinparam sequenceParticipantBorderColor #3366CC
+skinparam sequenceParticipantBackgroundColor #E8F0FE
+skinparam sequenceGroupBackgroundColor #F5F5F5
+skinparam sequenceDividerBackgroundColor #E0E0E0
+
+title End-to-End Error Scenarios
+
+participant "SQS" as SQS
+participant "Lambda\nHandler" as H
+participant "Phase 1\nBrowser" as P1
+participant "Phase 2\nfetchWithRetry" as P2
+participant "Circuit\nBreaker" as CB
+participant "Toast\nGraphQL API" as API
+participant "Dead-Letter\nQueue" as DLQ
+
+== Scenario 1: Phase 1 Timeout (browser fails to load page) ==
+
+SQS -> H: Message: restaurant URL
+H -> P1: interceptGraphQL(url)
+P1 -> P1: chromium.launch()
+P1 -> P1: page.goto() — **60s timeout**
+P1 -> P1: !! TimeoutError !!
+P1 -> P1: **finally { browser.close() }**
+note right of P1 #E8F5E9
+  Browser cleaned up
+  (old scraper leaked here)
+end note
+P1 -> H: throws Error
+H -> SQS: batchItemFailures\n(re-queue for fresh attempt)
+
+== Scenario 2: Phase 2 — Item gets 429 then succeeds ==
+
+H -> P2: fetchMenuItemDetails(item1)
+P2 -> API: POST MenuItemDetails
+API --> P2: **429 Too Many Requests**\nRetry-After: 3
+P2 -> P2: Wait 3 seconds
+P2 -> API: POST MenuItemDetails (retry 1)
+API --> P2: **200 OK**
+P2 -> H: Return modifier data
+
+== Scenario 3: Phase 2 — Item gets 5xx, exhausts retries ==
+
+H -> P2: fetchMenuItemDetails(item2)
+P2 -> API: POST (attempt 1)
+API --> P2: **503**
+P2 -> P2: Wait ~1s + jitter
+P2 -> API: POST (attempt 2)
+API --> P2: **503**
+P2 -> P2: Wait ~2s + jitter
+P2 -> API: POST (attempt 3)
+API --> P2: **503**
+P2 -> P2: Wait ~4s + jitter
+P2 -> API: POST (attempt 4 — final)
+API --> P2: **503**
+P2 -> H: throws ScrapingError\nfatal: false, retryCount: 3
+note right of P2
+  Item logged as failed
+  Other items continue
+  (Promise.allSettled)
+end note
+
+== Scenario 4: Phase 2 — Circuit breaker trips ==
+
+H -> P2: fetchMenuItemDetails(item3)
+P2 -> API: 4 attempts — all 503
+P2 -> CB: consecutiveFailures: 3
+H -> P2: fetchMenuItemDetails(item4)
+P2 -> API: 4 attempts — all 503
+P2 -> CB: consecutiveFailures: 4
+H -> P2: fetchMenuItemDetails(item5)
+P2 -> API: 4 attempts — all 503
+P2 -> CB: consecutiveFailures: **5**
+CB -> H: **CIRCUIT OPEN**\nSkip remaining 20 items
+note right of CB #FFF3E0
+  Saved ~80 wasted HTTP calls
+  (20 items x 4 attempts each)
+  Old scraper: no circuit breaker
+  would burn all 80 calls
+end note
+H -> SQS: batchItemFailures\n(re-queue — API may recover)
+
+== Scenario 5: Fatal error — restaurant doesn't exist ==
+
+SQS -> H: Message: invalid restaurant URL
+H -> P1: interceptGraphQL(url)
+P1 -> H: No menu data captured
+H -> P2: fetchMenuItemDetails — **404**
+P2 -> H: throws ScrapingError\n**fatal: true**
+H -> DLQ: Dead-letter\n(no re-queue)
+note right of DLQ #FFEBEE
+  Restaurant doesn't exist
+  Re-queuing would just fail again
+end note
+
+@enduml
+```
+
+### Exponential Backoff Timing
+
+Visual comparison of retry timing for a 5xx error across all 3 retries:
+
+```plantuml
+@startuml
+skinparam backgroundColor white
+
+title Exponential Backoff Timing — fetchWithRetry()
+
+concise "Attempt" as A
+concise "Backoff" as B
+
+@0
+A is "1 (initial)" #E8F0FE
+
+@1
+A is {-}
+B is "~1s + jitter" #FFF3E0
+
+@2
+A is "2 (retry 1)" #E8F0FE
+
+@4
+A is {-}
+B is "~2s + jitter" #FFF3E0
+
+@6
+A is "3 (retry 2)" #E8F0FE
+
+@10
+A is {-}
+B is "~4s + jitter" #FFF3E0
+
+@14
+A is "4 (final)" #FFEBEE
+
+@15
+A is {-}
+B is {-}
+
+@enduml
+```
+
+| Attempt | Delay Before | Formula | Worst Case |
+|---------|-------------|---------|------------|
+| 1 | 0ms (immediate) | — | — |
+| 2 | ~1-2s | 1000 * 2^0 + jitter | 2s |
+| 3 | ~2-3s | 1000 * 2^1 + jitter | 3s |
+| 4 (final) | ~4-5s | 1000 * 2^2 + jitter | 5s |
+| **Total** | | | **~10s max per item** |
+
+With circuit breaker at 5 consecutive failures: worst case is 5 items x 10s = **~50 seconds** before the scraper gives up on the batch — well within the 15-minute Lambda timeout.
 
 ---
 

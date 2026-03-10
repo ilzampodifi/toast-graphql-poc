@@ -2,12 +2,113 @@
  * Toast GraphQL Scraper
  * Phase 1: Playwright intercepts GraphQL responses (no HTML parsing)
  * Phase 2: Direct HTTP replay with captured cookies to fetch modifier details
+ *
+ * Cookie lifetime is ~30 minutes from Toast. Our max Lambda invocation is 15 minutes,
+ * so cookies captured in Phase 1 are always valid through Phase 2 — no persistence needed.
  */
 
 import { chromium } from "playwright";
 
 const GRAPHQL_URL = "https://ws-api.toasttab.com/do-federated-gateway/v1/graphql";
 const TOAST_BASE = "https://www.toasttab.com";
+
+// ─── Error handling ───
+
+const FATAL_STATUS_CODES = new Set([400, 401, 404, 410]);
+
+class ScrapingError extends Error {
+  readonly url: string;
+  readonly fatal: boolean;
+  readonly retryCount: number;
+  readonly statusCode?: number;
+  readonly timestamp: Date;
+  readonly responseBody?: string;
+
+  constructor(opts: {
+    message: string;
+    url: string;
+    fatal?: boolean;
+    retryCount?: number;
+    statusCode?: number;
+    responseBody?: string;
+  }) {
+    super(opts.message);
+    this.name = "ScrapingError";
+    this.url = opts.url;
+    this.fatal = opts.fatal ?? false;
+    this.retryCount = opts.retryCount ?? 0;
+    this.statusCode = opts.statusCode;
+    this.timestamp = new Date();
+    this.responseBody = opts.responseBody;
+  }
+}
+
+/**
+ * Fetch with retry, exponential backoff, and 429/5xx awareness.
+ * Matches the old scraper's HTTP client pattern: internal retries within a single
+ * Lambda invocation. If all retries fail, the Lambda handler can let SQS re-queue.
+ */
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries: number = 3
+): Promise<Response> {
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    const response = await fetch(url, options);
+
+    if (response.ok) return response;
+
+    const status = response.status;
+    const bodyText = await response.text().catch(() => "");
+    const snippet = bodyText.slice(0, 500);
+
+    // Fatal — no point retrying
+    if (FATAL_STATUS_CODES.has(status)) {
+      throw new ScrapingError({
+        message: `HTTP ${status} (fatal, not retryable)`,
+        url,
+        fatal: true,
+        retryCount: attempt - 1,
+        statusCode: status,
+        responseBody: snippet,
+      });
+    }
+
+    // Last attempt — throw
+    if (attempt > maxRetries) {
+      throw new ScrapingError({
+        message: `HTTP ${status} after ${maxRetries} retries`,
+        url,
+        fatal: false,
+        retryCount: maxRetries,
+        statusCode: status,
+        responseBody: snippet,
+      });
+    }
+
+    // 429 — honor Retry-After if present
+    if (status === 429) {
+      const retryAfter = response.headers.get("retry-after");
+      const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 5000;
+      console.warn(`   ⏳ Rate limited (429), waiting ${waitMs}ms before retry ${attempt}/${maxRetries}`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      continue;
+    }
+
+    // 5xx — exponential backoff with jitter
+    const baseDelay = 1000;
+    const exponentialDelay = baseDelay * Math.pow(2, attempt - 1);
+    const jitter = Math.random() * 1000;
+    const delay = Math.min(exponentialDelay + jitter, 30000);
+    console.warn(`   ⏳ HTTP ${status}, retrying in ${Math.round(delay)}ms (${attempt}/${maxRetries})`);
+    await new Promise((r) => setTimeout(r, delay));
+  }
+
+  // Unreachable, but TypeScript needs it
+  throw new ScrapingError({ message: "Retry loop exited unexpectedly", url, fatal: true });
+}
+
+// ─── Types ───
 
 interface SessionInfo {
   cookieString: string;
@@ -35,82 +136,97 @@ async function interceptGraphQL(targetUrl: string): Promise<{ data: ScrapedData;
 
   console.log(`🚀 Launching browser...`);
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-  });
-  const page = await context.newPage();
 
-  page.on("request", (request) => {
-    if (request.url().includes("/graphql") && request.method() === "POST") {
-      const headers = request.headers();
-      for (const key of Object.keys(headers)) {
-        if (key.startsWith("toast-") || key.startsWith("apollographql-")) {
-          capturedHeaders[key] = headers[key];
-        }
-      }
-    }
-  });
+  try {
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    });
+    const page = await context.newPage();
 
-  page.on("response", async (response) => {
-    if (!response.url().includes("/graphql") || response.status() !== 200) return;
-
-    try {
-      const json = await response.json();
-      const items = Array.isArray(json) ? json : [json];
-
-      for (const item of items) {
-        const data = item?.data;
-        if (!data) continue;
-
-        const restaurant = data.restaurantV2 ?? data.restaurantV2ByShortUrl;
-        if (restaurant) {
-          scraped.restaurant = restaurant;
-          console.log(`✅ Captured: Restaurant (${restaurant.name})`);
-        }
-
-        if (data.paginatedMenuItems) {
-          scraped.menu = data.paginatedMenuItems;
-          menuReceived = true;
-          const menus = data.paginatedMenuItems.menus ?? [];
-          let totalItems = 0;
-          for (const m of menus) {
-            for (const g of m.groups ?? []) {
-              totalItems += g.items?.length ?? 0;
-            }
+    page.on("request", (request) => {
+      if (request.url().includes("/graphql") && request.method() === "POST") {
+        const headers = request.headers();
+        for (const key of Object.keys(headers)) {
+          if (key.startsWith("toast-") || key.startsWith("apollographql-")) {
+            capturedHeaders[key] = headers[key]!;
           }
-          console.log(`✅ Captured: Menu (${menus.length} menus, ${totalItems} items)`);
-        }
-
-        if (data.popularItems?.items?.length) {
-          scraped.popularItems = data.popularItems;
-          console.log(`✅ Captured: Popular Items (${data.popularItems.items.length})`);
         }
       }
-    } catch {
-      // non-JSON, skip
+    });
+
+    page.on("response", async (response) => {
+      if (!response.url().includes("/graphql") || response.status() !== 200) return;
+
+      try {
+        const json = await response.json();
+        const items = Array.isArray(json) ? json : [json];
+
+        for (const item of items) {
+          const data = item?.data;
+          if (!data) continue;
+
+          const restaurant = data.restaurantV2 ?? data.restaurantV2ByShortUrl;
+          if (restaurant) {
+            scraped.restaurant = restaurant;
+            console.log(`✅ Captured: Restaurant (${restaurant.name})`);
+          }
+
+          if (data.paginatedMenuItems) {
+            scraped.menu = data.paginatedMenuItems;
+            menuReceived = true;
+            const menus = data.paginatedMenuItems.menus ?? [];
+            let totalItems = 0;
+            for (const m of menus) {
+              for (const g of m.groups ?? []) {
+                totalItems += g.items?.length ?? 0;
+              }
+            }
+            console.log(`✅ Captured: Menu (${menus.length} menus, ${totalItems} items)`);
+          }
+
+          if (data.popularItems?.items?.length) {
+            scraped.popularItems = data.popularItems;
+            console.log(`✅ Captured: Popular Items (${data.popularItems.items.length})`);
+          }
+        }
+      } catch {
+        // non-JSON, skip
+      }
+    });
+
+    console.log(`🌐 Navigating to: ${targetUrl}`);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+    const deadline = Date.now() + 30000;
+    while (!menuReceived && Date.now() < deadline) {
+      await page.waitForTimeout(500);
     }
-  });
 
-  console.log(`🌐 Navigating to: ${targetUrl}`);
-  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    const cookies = await context.cookies();
+    const cookieString = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    console.log(`🍪 Extracted ${cookies.length} cookies`);
 
-  const deadline = Date.now() + 30000;
-  while (!menuReceived && Date.now() < deadline) {
-    await page.waitForTimeout(500);
+    // Validate Phase 1 captured data before proceeding
+    if (!capturedHeaders["toast-session-id"]) {
+      console.warn(`⚠️  No toast-session-id captured — Phase 2 requests may fail`);
+    }
+
+    if (scraped.menu) {
+      const menus = scraped.menu.menus ?? [];
+      if (menus.length === 0) {
+        console.warn(`⚠️  Menu captured but contains 0 menus — possible HTML structure change`);
+      }
+    }
+
+    return {
+      data: scraped,
+      session: { cookieString, capturedHeaders },
+    };
+  } finally {
+    await browser.close();
+    console.log(`🔒 Browser closed`);
   }
-
-  const cookies = await context.cookies();
-  const cookieString = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-  console.log(`🍪 Extracted ${cookies.length} cookies`);
-
-  await browser.close();
-  console.log(`🔒 Browser closed`);
-
-  return {
-    data: scraped,
-    session: { cookieString, capturedHeaders },
-  };
 }
 
 // ─── Phase 2: Direct HTTP for modifier details ───
@@ -173,15 +289,11 @@ async function fetchMenuItemDetails(
   const operationNames = body.map((op) => op.operationName).join(",");
   const hashes = body.map((op) => op.extensions.persistedQuery.sha256Hash).join(",");
 
-  const response = await fetch(GRAPHQL_URL, {
+  const response = await fetchWithRetry(GRAPHQL_URL, {
     method: "POST",
     headers: buildHeaders(session, operationNames, hashes),
     body: JSON.stringify(body),
   });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
 
   const json: any = await response.json();
   const items = Array.isArray(json) ? json : [json];
@@ -237,9 +349,19 @@ async function fetchAllModifiers(
 ): Promise<Map<string, any>> {
   const modifiers = new Map<string, any>();
   let completed = 0;
+  let consecutiveFailures = 0;
+  const CIRCUIT_BREAKER_THRESHOLD = 5;
 
   // Process in batches
   for (let i = 0; i < itemRefs.length; i += concurrency) {
+    // Circuit breaker: if N consecutive failures, the API is likely down
+    if (consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+      console.warn(
+        `   🛑 Circuit breaker: ${consecutiveFailures} consecutive failures, skipping remaining ${itemRefs.length - completed} items`
+      );
+      break;
+    }
+
     const batch = itemRefs.slice(i, i + concurrency);
 
     const results = await Promise.allSettled(
@@ -252,6 +374,7 @@ async function fetchAllModifiers(
     for (const r of results) {
       completed++;
       if (r.status === "fulfilled") {
+        consecutiveFailures = 0;
         const { ref, result } = r.value;
         const modGroups = result.menuItemDetails?.modifierGroups ?? [];
         modifiers.set(ref.guid, {
@@ -262,7 +385,11 @@ async function fetchAllModifiers(
           `   [${completed}/${itemRefs.length}] ${ref.name} — ${modGroups.length} modifier group(s)`
         );
       } else {
-        console.log(`   [${completed}/${itemRefs.length}] ❌ Failed: ${r.reason}`);
+        consecutiveFailures++;
+        const reason = r.reason instanceof ScrapingError
+          ? `HTTP ${r.reason.statusCode} after ${r.reason.retryCount} retries`
+          : r.reason;
+        console.log(`   [${completed}/${itemRefs.length}] ❌ Failed: ${reason}`);
       }
     }
 
